@@ -1,8 +1,9 @@
 'use client';
 
-import { useState } from "react";
+import { useState, useRef, useLayoutEffect, useEffect } from "react";
 import Card from "./components/Card";
 import { DragDropContext, Droppable, Draggable, DropResult } from '@hello-pangea/dnd';
+import ConnectorLines from "./components/ConnectorLines";
 
 interface CardData {
   id: string;
@@ -26,6 +27,60 @@ export default function Home() {
   ]);
   const [expandedColumns, setExpandedColumns] = useState<{ [id: string]: boolean }>({});
   const [subCardOrder, setSubCardOrder] = useState<{ [parentId: string]: string[] }>({});
+  const [debugMode, setDebugMode] = useState(false);
+
+  // Track refs for each card
+  const cardRefs = useRef<{ [id: string]: HTMLDivElement | null }>({});
+  const [cardPositions, setCardPositions] = useState<{ [id: string]: { x: number; y: number; width: number; height: number } }>({});
+
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  const [boardRect, setBoardRect] = useState<{ x: number; y: number; width: number; height: number }>({ x: 0, y: 0, width: 0, height: 0 });
+
+  // Track the parent ID of the card being dragged
+  const dragParentId = useRef<string | null>(null);
+
+  // Helper to measure positions
+  function measurePositions() {
+    if (boardRef.current) {
+      const rect = boardRef.current.getBoundingClientRect();
+      setBoardRect({
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+      });
+    }
+    const newPositions: { [id: string]: { x: number; y: number; width: number; height: number } } = {};
+    Object.entries(cardRefs.current).forEach(([id, ref]) => {
+      if (ref) {
+        const rect = ref.getBoundingClientRect();
+        newPositions[id] = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+      }
+    });
+    setCardPositions(newPositions);
+  }
+
+  // Update card positions and board rect after render and on resize
+  useLayoutEffect(() => {
+    measurePositions();
+    function handleResize() {
+      measurePositions();
+    }
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, [cards, expandedColumns, subCardOrder]);
+
+  // Force measurement after every render
+  useEffect(() => {
+    setTimeout(measurePositions, 0);
+  });
 
   const addCard = () => {
     const newId = (Date.now() + Math.random()).toString();
@@ -162,6 +217,29 @@ export default function Home() {
     );
   }
 
+  // Helper to find parent ID of a card
+  function findParentId(nodes: CardData[], childId: string, parentId: string | null = null): string | null {
+    for (const node of nodes) {
+      if (node.id === childId) return parentId;
+      if (node.children) {
+        const found = findParentId(node.children, childId, node.id);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  // Helper to handle drag start
+  function onDragStart(start: any) {
+    const sourceColIdx = parseInt(start.source.droppableId.replace('column-', ''));
+    const sourceIdx = start.source.index;
+    const columnsData = buildColumns(cards, expandedColumns);
+    const card = columnsData[sourceColIdx][sourceIdx];
+    dragParentId.current = findParentId(cards, card.id);
+    console.log('Drag start:', { cardId: card.id, parentId: dragParentId.current });
+  }
+
+  // Helper to handle drag end
   const onDragEnd = (result: DropResult) => {
     if (!result.destination) return;
     const sourceColIdx = parseInt(result.source.droppableId.replace('column-', ''));
@@ -172,53 +250,116 @@ export default function Home() {
     const card = columnsData[sourceColIdx][sourceIdx];
     const [removedCard, treeWithout] = removeCardFromTree(cards, card.id);
     if (!removedCard) return;
-    let parentId: string | null = null;
-    let insertIndex = destIdx;
-    let oldParentId: string | null = null;
-    if (sourceColIdx > 0) {
-      const prevCol = columnsData[sourceColIdx - 1];
-      let parentCard = prevCol[prevCol.length - 1];
-      if (sourceIdx < prevCol.length) {
-        parentCard = prevCol[sourceIdx];
-      }
-      oldParentId = parentCard ? parentCard.id : null;
-    }
+    // Find old and new parent IDs
+    const oldParentId = dragParentId.current;
+    let newParentId: string | null = null;
     if (destColIdx > 0) {
       const prevCol = columnsData[destColIdx - 1];
       let parentCard = prevCol[prevCol.length - 1];
       if (destIdx < prevCol.length) {
         parentCard = prevCol[destIdx];
       }
-      parentId = parentCard ? parentCard.id : null;
-      insertIndex = destIdx;
+      newParentId = parentCard ? parentCard.id : null;
+    }
+    let insertIndex = destIdx;
+    if (newParentId) {
+      const parentCard = columnsData[destColIdx - 1].find(c => c.id === newParentId);
       if (parentCard && parentCard.children) {
         insertIndex = Math.min(destIdx, parentCard.children.length);
       } else {
         insertIndex = 0;
       }
-      setSubCardOrder(prev => {
-        let newOrder = { ...prev };
-        if (oldParentId && oldParentId !== parentId) {
-          if (newOrder[oldParentId]) {
-            newOrder[oldParentId] = newOrder[oldParentId].filter(id => id !== card.id);
-          }
-        }
-        const currentOrder = newOrder[parentId!] || (parentCard.children ? parentCard.children.map(c => c.id) : []);
+    }
+    // Update only the relevant parent's subCardOrder
+    setSubCardOrder(prev => {
+      let newOrder = { ...prev };
+      if (oldParentId && newOrder[oldParentId]) {
+        newOrder[oldParentId] = newOrder[oldParentId].filter(id => id !== card.id);
+      }
+      if (newParentId) {
+        const currentOrder = newOrder[newParentId] || [];
         const filtered = currentOrder.filter(id => id !== card.id);
         filtered.splice(insertIndex, 0, card.id);
-        newOrder[parentId!] = filtered;
-        return newOrder;
-      });
-    }
-    const newTree = insertCardToTree(treeWithout, removedCard, parentId, insertIndex);
+        newOrder[newParentId] = filtered;
+      }
+      return newOrder;
+    });
+    const newTree = insertCardToTree(treeWithout, removedCard, newParentId, insertIndex);
     setCards(newTree);
+    // Debug logging
+    console.log('Drag end:', { cardId: card.id, oldParentId, newParentId, insertIndex });
+    setTimeout(() => {
+      measurePositions();
+    }, 50);
   };
 
   const columns = buildColumns(cards, expandedColumns);
 
+  // Helper to get anchor points relative to board
+  function getAnchor(cardId: string, type: 'source' | 'target') {
+    const pos = cardPositions[cardId];
+    if (!pos || pos.width === 0 || pos.height === 0) return { x: 0, y: 0 };
+    const relX = pos.x - boardRect.x;
+    const relY = pos.y - boardRect.y;
+    const anchorY = relY + pos.height / 2;
+    let anchor;
+    if (type === 'source') {
+      anchor = { x: relX + pos.width - 12, y: anchorY - 12 };
+    } else {
+      anchor = { x: relX, y: anchorY - 12 };
+    }
+    if (debugMode) {
+      console.log(`Anchor for card ${cardId} (${type}):`, anchor);
+    }
+    return anchor;
+  }
+
+  // Recursively generate connectors for all parent-child relationships
+  function getConnectors(cards: CardData[]): any[] {
+    let connectors: any[] = [];
+    for (const card of cards) {
+      if (card.children && card.children.length > 0) {
+        for (const child of card.children) {
+          const source = getAnchor(card.id, 'source');
+          const target = getAnchor(child.id, 'target');
+          // Only draw if both anchors are valid (not at 0,0)
+          if ((source.x !== 0 || source.y !== 0) && (target.x !== 0 || target.y !== 0)) {
+            const dx = target.x - source.x;
+            const path = `M${source.x},${source.y} C${source.x + dx/2},${source.y} ${target.x - dx/2},${target.y} ${target.x},${target.y}`;
+            connectors.push({
+              id: `${card.id}->${child.id}`,
+              sourceAnchor: { ...source, id: `${card.id}-source`, cardId: card.id, type: 'source' },
+              targetAnchor: { ...target, id: `${child.id}-target`, cardId: child.id, type: 'target' },
+              path,
+            });
+          }
+          if (child.children && child.children.length > 0) {
+            connectors = connectors.concat(getConnectors([child]));
+          }
+        }
+      }
+    }
+    return connectors;
+  }
+
+  const connectors = getConnectors(cards);
+
+  // Debug: Log positions before rendering connectors
+  if (debugMode) {
+    console.log('cardPositions', cardPositions);
+    console.log('boardRect', boardRect);
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 p-0 flex flex-col items-stretch w-full h-screen overflow-hidden">
       <h1 className="text-3xl font-bold mb-8 text-gray-900 dark:text-white px-8 pt-8">Goal Board</h1>
+      <button
+        className="mb-2 px-3 py-1 bg-gray-200 text-gray-800 rounded hover:bg-gray-300 transition ml-8"
+        onClick={() => setDebugMode(d => !d)}
+        style={{ alignSelf: 'flex-start' }}
+      >
+        {debugMode ? 'Disable Debug' : 'Enable Debug'}
+      </button>
       <button
         className="mb-6 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition ml-8"
         onClick={addCard}
@@ -227,16 +368,18 @@ export default function Home() {
         + Add Card
       </button>
       <div
-        className="flex-1 overflow-auto"
+        className="flex-1 overflow-auto relative"
         style={{ touchAction: 'pan-x pan-y', WebkitOverflowScrolling: 'touch' }}
       >
         <div
+          ref={boardRef}
           className="flex flex-row gap-8 items-start w-fit min-h-[400px] px-8 pb-8"
-          style={{ minWidth: '100%' }}
+          style={{ minWidth: '100%', position: 'relative' }}
         >
+          <ConnectorLines connectors={connectors} boardRect={boardRect} debug={debugMode} />
           {columns.map((col, colIdx) => {
             return (
-              <DragDropContext onDragEnd={onDragEnd} key={colIdx}>
+              <DragDropContext onDragEnd={onDragEnd} onDragStart={onDragStart} key={colIdx}>
                 <Droppable droppableId={`column-${colIdx}`}>
                   {(provided) => (
                     <div
@@ -246,13 +389,14 @@ export default function Home() {
                     >
                       {col.map((card, idx) => {
                         return (
-                          <div
-                            key={card.id}
-                          >
+                          <div key={card.id}>
                             <Draggable draggableId={card.id} index={idx} key={card.id}>
                               {(provided, snapshot) => (
                                 <div
-                                  ref={provided.innerRef}
+                                  ref={el => {
+                                    provided.innerRef(el);
+                                    cardRefs.current[card.id] = el;
+                                  }}
                                   {...provided.draggableProps}
                                   {...provided.dragHandleProps}
                                   style={{
@@ -261,12 +405,14 @@ export default function Home() {
                                   }}
                                 >
                                   <Card
+                                    cardId={card.id}
                                     title={card.title}
                                     description={card.description}
                                     tags={card.tags}
                                     assignee={card.assignee}
                                     onEdit={data => editCard(card.id, data)}
                                     onDelete={() => deleteCard(card.id)}
+                                    debug={debugMode}
                                   />
                                   <div className="flex gap-2 mt-1 mb-2">
                                     <button
