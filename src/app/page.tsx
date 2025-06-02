@@ -28,6 +28,9 @@ export default function Home() {
   const [expandedColumns, setExpandedColumns] = useState<{ [id: string]: boolean }>({});
   const [subCardOrder, setSubCardOrder] = useState<{ [parentId: string]: string[] }>({});
   const [debugMode, setDebugMode] = useState(false);
+  const [columnOrder, setColumnOrder] = useState<{ [colIdx: number]: string[] }>({});
+  const [globalSortOrder, setGlobalSortOrder] = useState<{ [colIdx: number]: string[] }>({});
+  const [globalSubCardOrder, setGlobalSubCardOrder] = useState<string[]>([]);
 
   // Track refs for each card
   const cardRefs = useRef<{ [id: string]: HTMLDivElement | null }>({});
@@ -120,6 +123,14 @@ export default function Home() {
       );
     setCards(cards => addToTree(cards));
     setExpandedColumns(cols => ({ ...cols, [parentId]: true }));
+    setSubCardOrder(prev => {
+      const prevOrder = prev[parentId] || [];
+      return {
+        ...prev,
+        [parentId]: [...prevOrder, newId],
+      };
+    });
+    setGlobalSubCardOrder(prev => [...prev, newId]);
   };
 
   const editCard = (id: string, data: { title: string; description?: string; tags?: string[]; assignee?: string }) => {
@@ -164,8 +175,20 @@ export default function Home() {
       }
     });
     if (nextLevel.length > 0) {
-      const subColumns = buildColumns(nextLevel, expandedColumns);
-      for (let i = 0; i < subColumns.length; i++) {
+      // Use globalSubCardOrder for the next level (sub-cards)
+      let orderedNextLevel = nextLevel;
+      if (globalSubCardOrder.length > 0) {
+        const idToCard: { [id: string]: CardData } = {};
+        nextLevel.forEach(card => { idToCard[card.id] = card; });
+        orderedNextLevel = globalSubCardOrder.map(id => idToCard[id]).filter(Boolean);
+        // Add any missing cards (e.g., new ones)
+        const missing = nextLevel.filter(card => !globalSubCardOrder.includes(card.id));
+        orderedNextLevel = [...orderedNextLevel, ...missing];
+      }
+      columns.push(orderedNextLevel);
+      // Recursively build further columns if needed
+      const subColumns = buildColumns(orderedNextLevel, expandedColumns);
+      for (let i = 1; i < subColumns.length; i++) {
         if (columns[i + 1]) {
           columns[i + 1] = [...columns[i + 1], ...subColumns[i]];
         } else {
@@ -246,48 +269,70 @@ export default function Home() {
     const destColIdx = parseInt(result.destination.droppableId.replace('column-', ''));
     const sourceIdx = result.source.index;
     const destIdx = result.destination.index;
+    // If dragging within the parent card column (column 0), reorder the top-level cards array
+    if (sourceColIdx === 0 && destColIdx === 0) {
+      setCards(prevCards => {
+        const newCards = [...prevCards];
+        const [removed] = newCards.splice(sourceIdx, 1);
+        newCards.splice(destIdx, 0, removed);
+        return newCards;
+      });
+      setTimeout(() => {
+        measurePositions();
+      }, 50);
+      return;
+    }
+    // Allow reordering in any column (sub-cards)
+    if (sourceColIdx !== destColIdx) return;
     const columnsData = buildColumns(cards, expandedColumns);
-    const card = columnsData[sourceColIdx][sourceIdx];
-    const [removedCard, treeWithout] = removeCardFromTree(cards, card.id);
-    if (!removedCard) return;
-    // Find old and new parent IDs
-    const oldParentId = dragParentId.current;
-    let newParentId: string | null = null;
-    if (destColIdx > 0) {
-      const prevCol = columnsData[destColIdx - 1];
-      let parentCard = prevCol[prevCol.length - 1];
-      if (destIdx < prevCol.length) {
-        parentCard = prevCol[destIdx];
-      }
-      newParentId = parentCard ? parentCard.id : null;
-    }
-    let insertIndex = destIdx;
-    if (newParentId) {
-      const parentCard = columnsData[destColIdx - 1].find(c => c.id === newParentId);
-      if (parentCard && parentCard.children) {
-        insertIndex = Math.min(destIdx, parentCard.children.length);
-      } else {
-        insertIndex = 0;
-      }
-    }
-    // Update only the relevant parent's subCardOrder
+    const subCards = columnsData[sourceColIdx];
+    const movedCardId = subCards[sourceIdx].id;
+    // Update globalSubCardOrder
+    setGlobalSubCardOrder(prev => {
+      const order = prev.length ? [...prev] : subCards.map(card => card.id);
+      const [removed] = order.splice(sourceIdx, 1);
+      order.splice(destIdx, 0, removed);
+      return order;
+    });
+    // Update subCardOrder for the old and new parent
     setSubCardOrder(prev => {
-      let newOrder = { ...prev };
-      if (oldParentId && newOrder[oldParentId]) {
-        newOrder[oldParentId] = newOrder[oldParentId].filter(id => id !== card.id);
+      const newOrder = { ...prev };
+      // Find old parent
+      const oldParentId = findParentId(cards, movedCardId);
+      // Find new parent
+      let newParentId = null;
+      if (destIdx >= subCards.length) {
+        // Dropped at the end: use the parent of the last card, or keep old parent if only one card
+        newParentId = subCards.length > 0 ? findParentId(cards, subCards[subCards.length - 1].id) : oldParentId;
+      } else {
+        newParentId = findParentId(cards, subCards[destIdx].id);
       }
+      // Remove from old parent's order
+      if (oldParentId && newOrder[oldParentId]) {
+        newOrder[oldParentId] = newOrder[oldParentId].filter(id => id !== movedCardId);
+      }
+      // Insert into new parent's order at the correct position
       if (newParentId) {
-        const currentOrder = newOrder[newParentId] || [];
-        const filtered = currentOrder.filter(id => id !== card.id);
-        filtered.splice(insertIndex, 0, card.id);
-        newOrder[newParentId] = filtered;
+        // Get the new parent's sub-card order (excluding the moved card)
+        let siblings = (newOrder[newParentId] || []).filter(id => id !== movedCardId);
+        // Find the index to insert at, among siblings
+        let insertIdx = siblings.length; // default to end
+        // Find the sibling in the new parent's order that is at destIdx in the column
+        let count = 0;
+        for (let i = 0; i < subCards.length; i++) {
+          if (findParentId(cards, subCards[i].id) === newParentId) {
+            if (i === destIdx) {
+              insertIdx = count;
+              break;
+            }
+            count++;
+          }
+        }
+        siblings.splice(insertIdx, 0, movedCardId);
+        newOrder[newParentId] = siblings;
       }
       return newOrder;
     });
-    const newTree = insertCardToTree(treeWithout, removedCard, newParentId, insertIndex);
-    setCards(newTree);
-    // Debug logging
-    console.log('Drag end:', { cardId: card.id, oldParentId, newParentId, insertIndex });
     setTimeout(() => {
       measurePositions();
     }, 50);
